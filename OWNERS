@@ -1,12 +1,5 @@
 # See the OWNERS docs at https://go.k8s.io/owners
 
 approvers:
-- kubernetes-csi-approvers
-- gnufied
-- mlmhl
-
-reviewers:
-- kubernetes-csi-reviewers
-
-# emeritus_reviewers:
-# - mlmhl
+- openshift-storage-maintainers
+component: "Storage / Kubernetes External Components"
