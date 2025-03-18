@@ -211,7 +211,7 @@ func TestController(t *testing.T) {
 			disableVolumeInUseErrorHandler: true,
 		},
 	} {
-		client := csi.NewMockClient("mock", test.NodeResize, true, false, true, true)
+		client := csi.NewMockClient("mock", test.NodeResize, true, false, true, true, false)
 		driverName, _ := client.GetDriverName(context.TODO())
 
 		var expectedCap resource.Quantity
@@ -245,7 +245,7 @@ func TestController(t *testing.T) {
 		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.AnnotateFsResize, true)
 		controller := NewResizeController(driverName, csiResizer,
 			kubeClient, time.Second,
-			informerFactory, workqueue.DefaultControllerRateLimiter(),
+			informerFactory, workqueue.DefaultTypedControllerRateLimiter[string](),
 			!test.disableVolumeInUseErrorHandler,
 			2*time.Minute /* maxRetryInterval */)
 
@@ -380,7 +380,7 @@ func TestResizePVC(t *testing.T) {
 		},
 	} {
 		t.Run(test.Name, func(t *testing.T) {
-			client := csi.NewMockClient("mock", test.NodeResize, true, false, true, true)
+			client := csi.NewMockClient("mock", test.NodeResize, true, false, true, true, false)
 			if test.expansionError != nil {
 				client.SetExpansionError(test.expansionError)
 			}
@@ -410,7 +410,7 @@ func TestResizePVC(t *testing.T) {
 			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.AnnotateFsResize, true)
 			controller := NewResizeController(driverName, csiResizer,
 				kubeClient, time.Second,
-				informerFactory, workqueue.DefaultControllerRateLimiter(),
+				informerFactory, workqueue.DefaultTypedControllerRateLimiter[string](),
 				true, /* disableVolumeInUseErrorHandler*/
 				2*time.Minute /* maxRetryInterval */)
 

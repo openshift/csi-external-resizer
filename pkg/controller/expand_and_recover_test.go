@@ -153,7 +153,7 @@ func TestExpandAndRecover(t *testing.T) {
 		test := tests[i]
 		t.Run(test.name, func(t *testing.T) {
 			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.RecoverVolumeExpansionFailure, true)
-			client := csi.NewMockClient("foo", !test.disableNodeExpansion, !test.disableControllerExpansion, false, true, true)
+			client := csi.NewMockClient("foo", !test.disableNodeExpansion, !test.disableControllerExpansion, false, true, true, false)
 			driverName, _ := client.GetDriverName(context.TODO())
 			if test.expansionError != nil {
 				client.SetExpansionError(test.expansionError)
@@ -173,7 +173,7 @@ func TestExpandAndRecover(t *testing.T) {
 			controller := NewResizeController(driverName,
 				csiResizer, kubeClient,
 				time.Second, informerFactory,
-				workqueue.DefaultControllerRateLimiter(), true /*handleVolumeInUseError*/, 2*time.Minute /*maxRetryInterval*/)
+				workqueue.DefaultTypedControllerRateLimiter[string](), true /*handleVolumeInUseError*/, 2*time.Minute /*maxRetryInterval*/)
 
 			ctrlInstance, _ := controller.(*resizeController)
 			recorder := record.NewFakeRecorder(10)

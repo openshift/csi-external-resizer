@@ -47,19 +47,22 @@ type ModifyController interface {
 }
 
 type modifyController struct {
-	name            string
-	modifier        modifier.Modifier
-	kubeClient      kubernetes.Interface
-	claimQueue      workqueue.RateLimitingInterface
-	eventRecorder   record.EventRecorder
-	pvLister        corelisters.PersistentVolumeLister
-	pvListerSynced  cache.InformerSynced
-	pvcLister       corelisters.PersistentVolumeClaimLister
-	pvcListerSynced cache.InformerSynced
-	vacLister       storagev1beta1listers.VolumeAttributesClassLister
-	vacListerSynced cache.InformerSynced
+	name                string
+	modifier            modifier.Modifier
+	kubeClient          kubernetes.Interface
+	claimQueue          workqueue.TypedRateLimitingInterface[string]
+	eventRecorder       record.EventRecorder
+	pvLister            corelisters.PersistentVolumeLister
+	pvListerSynced      cache.InformerSynced
+	pvcLister           corelisters.PersistentVolumeClaimLister
+	pvcListerSynced     cache.InformerSynced
+	vacLister           storagev1beta1listers.VolumeAttributesClassLister
+	vacListerSynced     cache.InformerSynced
+	extraModifyMetadata bool
 	// the key of the map is {PVC_NAMESPACE}/{PVC_NAME}
 	uncertainPVCs map[string]v1.PersistentVolumeClaim
+	// slowSet tracks PVCs for which modification failed with infeasible error and should be retried at slower rate.
+	slowSet *util.SlowSet
 }
 
 // NewModifyController returns a ModifyController.
@@ -68,8 +71,10 @@ func NewModifyController(
 	modifier modifier.Modifier,
 	kubeClient kubernetes.Interface,
 	resyncPeriod time.Duration,
+	maxRetryInterval time.Duration,
+	extraModifyMetadata bool,
 	informerFactory informers.SharedInformerFactory,
-	pvcRateLimiter workqueue.RateLimiter) ModifyController {
+	pvcRateLimiter workqueue.TypedRateLimiter[string]) ModifyController {
 	pvInformer := informerFactory.Core().V1().PersistentVolumes()
 	pvcInformer := informerFactory.Core().V1().PersistentVolumeClaims()
 	vacInformer := informerFactory.Storage().V1beta1().VolumeAttributesClasses()
@@ -79,23 +84,27 @@ func NewModifyController(
 	eventRecorder := eventBroadcaster.NewRecorder(scheme.Scheme,
 		v1.EventSource{Component: fmt.Sprintf("external-resizer %s", name)})
 
-	claimQueue := workqueue.NewNamedRateLimitingQueue(
-		pvcRateLimiter, fmt.Sprintf("%s-pvc", name))
+	claimQueue := workqueue.NewTypedRateLimitingQueueWithConfig(
+		pvcRateLimiter, workqueue.TypedRateLimitingQueueConfig[string]{
+			Name: fmt.Sprintf("%s-pvc", name),
+		})
 
 	ctrl := &modifyController{
-		name:            name,
-		modifier:        modifier,
-		kubeClient:      kubeClient,
-		pvListerSynced:  pvInformer.Informer().HasSynced,
-		pvLister:        pvInformer.Lister(),
-		pvcListerSynced: pvcInformer.Informer().HasSynced,
-		pvcLister:       pvcInformer.Lister(),
-		vacListerSynced: vacInformer.Informer().HasSynced,
-		vacLister:       vacInformer.Lister(),
-		claimQueue:      claimQueue,
-		eventRecorder:   eventRecorder,
+		name:                name,
+		modifier:            modifier,
+		kubeClient:          kubeClient,
+		pvListerSynced:      pvInformer.Informer().HasSynced,
+		pvLister:            pvInformer.Lister(),
+		pvcListerSynced:     pvcInformer.Informer().HasSynced,
+		pvcLister:           pvcInformer.Lister(),
+		vacListerSynced:     vacInformer.Informer().HasSynced,
+		vacLister:           vacInformer.Lister(),
+		claimQueue:          claimQueue,
+		eventRecorder:       eventRecorder,
+		extraModifyMetadata: extraModifyMetadata,
+		slowSet:             util.NewSlowSet(maxRetryInterval),
 	}
-	// Add a resync period as the PVC's request modify can be modified again when we handling
+	// Add a resync period as the PVC's request modify can be modified again when we are handling
 	// a previous modify request of the same PVC.
 	pvcInformer.Informer().AddEventHandlerWithResyncPeriod(cache.ResourceEventHandlerFuncs{
 		AddFunc:    ctrl.addPVC,
@@ -176,25 +185,6 @@ func (ctrl *modifyController) deletePVC(obj interface{}) {
 	ctrl.claimQueue.Forget(objKey)
 }
 
-// modifyPVC modifies the PVC and PV based on VAC
-func (ctrl *modifyController) modifyPVC(pvc *v1.PersistentVolumeClaim, pv *v1.PersistentVolume) error {
-	var err error
-	if isFirstTimeModifyVolumeWithPVC(pvc, pv) {
-		// If it is first time adding a vac, always validate and then call modify volume
-		_, _, err, _ = ctrl.validateVACAndModifyVolumeWithTarget(pvc, pv)
-	} else {
-		_, _, err, _ = ctrl.modify(pvc, pv)
-	}
-	return err
-}
-
-func isFirstTimeModifyVolumeWithPVC(pvc *v1.PersistentVolumeClaim, pv *v1.PersistentVolume) bool {
-	if pv.Spec.VolumeAttributesClassName == nil && pvc.Spec.VolumeAttributesClassName != nil {
-		return true
-	}
-	return false
-}
-
 func (ctrl *modifyController) init(ctx context.Context) bool {
 	informersSyncd := []cache.InformerSynced{ctrl.pvListerSynced, ctrl.pvcListerSynced}
 	informersSyncd = append(informersSyncd, ctrl.vacListerSynced)
@@ -225,6 +215,10 @@ func (ctrl *modifyController) Run(
 	}
 
 	stopCh := ctx.Done()
+
+	// Starts go-routine that deletes expired slowSet entries.
+	go ctrl.slowSet.Run(stopCh)
+
 	for i := 0; i < workers; i++ {
 		go wait.Until(ctrl.sync, 0, stopCh)
 	}
@@ -240,7 +234,7 @@ func (ctrl *modifyController) sync() {
 	}
 	defer ctrl.claimQueue.Done(key)
 
-	if err := ctrl.syncPVC(key.(string)); err != nil {
+	if err := ctrl.syncPVC(key); err != nil {
 		// Put PVC back to the queue so that we can retry later.
 		klog.ErrorS(err, "Error syncing PVC")
 		ctrl.claimQueue.AddRateLimited(key)
@@ -249,7 +243,7 @@ func (ctrl *modifyController) sync() {
 	}
 }
 
-// syncPVC checks if a pvc requests resizing, and execute the resize operation if requested.
+// syncPVC checks if a pvc requests modification, and execute the ModifyVolume operation if requested.
 func (ctrl *modifyController) syncPVC(key string) error {
 	klog.V(4).InfoS("Started PVC processing for modify controller", "key", key)
 
@@ -274,11 +268,16 @@ func (ctrl *modifyController) syncPVC(key string) error {
 	}
 
 	// Only trigger modify volume if the following conditions are met
-	// 1. Non empty vac name
-	// 2. PVC is in Bound state
-	// 3. PV CSI driver name matches local driver
+	// 1. PV provisioned by CSI driver AND driver name matches local driver
+	// 2. Non-empty vac name
+	// 3. PVC is in Bound state
+	if pv.Spec.CSI == nil || pv.Spec.CSI.Driver != ctrl.name {
+		klog.V(7).InfoS("Skipping PV provisioned by different driver", "PV", klog.KObj(pv))
+		return nil
+	}
+
 	vacName := pvc.Spec.VolumeAttributesClassName
-	if vacName != nil && *vacName != "" && pvc.Status.Phase == v1.ClaimBound && pv.Spec.CSI.Driver == ctrl.name {
+	if vacName != nil && *vacName != "" && pvc.Status.Phase == v1.ClaimBound {
 		_, _, err, _ := ctrl.modify(pvc, pv)
 		if err != nil {
 			return err

@@ -42,6 +42,7 @@ import (
 	"github.com/kubernetes-csi/external-resizer/pkg/util"
 	csitrans "k8s.io/csi-translation-lib"
 
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
@@ -52,6 +53,9 @@ import (
 	"k8s.io/component-base/logs"
 	logsapi "k8s.io/component-base/logs/api/v1"
 	_ "k8s.io/component-base/logs/json/register"
+	"k8s.io/component-base/metrics/legacyregistry"
+	_ "k8s.io/component-base/metrics/prometheus/clientgo/leaderelection" // register leader election in the default legacy registry
+	_ "k8s.io/component-base/metrics/prometheus/workqueue"               // register work queues in the default legacy registry
 )
 
 var (
@@ -59,6 +63,8 @@ var (
 	kubeConfig   = flag.String("kubeconfig", "", "Absolute path to the kubeconfig")
 	resyncPeriod = flag.Duration("resync-period", time.Minute*10, "Resync period for cache")
 	workers      = flag.Int("workers", 10, "Concurrency to process multiple resize requests")
+
+	extraModifyMetadata = flag.Bool("extra-modify-metadata", false, "If set, add pv/pvc metadata to plugin modify requests as parameters.")
 
 	csiAddress = flag.String("csi-address", "/run/csi/socket", "Address of the CSI driver socket.")
 	timeout    = flag.Duration("timeout", 10*time.Second, "Timeout for waiting for CSI driver socket.")
@@ -134,6 +140,7 @@ func main() {
 
 	config.QPS = float32(*kubeAPIQPS)
 	config.Burst = *kubeAPIBurst
+	config.ContentType = runtime.ContentTypeProtobuf
 
 	kubeClient, err := kubernetes.NewForConfig(config)
 	if err != nil {
@@ -173,6 +180,10 @@ func main() {
 		csiClient = migratedCsiClient
 	}
 
+	// Add default legacy registry so that metrics manager serves Go runtime and process metrics.
+	// Also registers the `k8s.io/component-base/` work queue and leader election metrics we anonymously import.
+	metricsManager.WithAdditionalRegistry(legacyregistry.DefaultGatherer)
+
 	csiResizer, err := resizer.NewResizerFromClient(
 		csiClient,
 		*timeout,
@@ -188,6 +199,7 @@ func main() {
 		*timeout,
 		kubeClient,
 		informerFactory,
+		*extraModifyMetadata,
 		driverName)
 	if err != nil {
 		klog.ErrorS(err, "Failed to create CSI modifier")
@@ -210,15 +222,15 @@ func main() {
 
 	resizerName := csiResizer.Name()
 	rc := controller.NewResizeController(resizerName, csiResizer, kubeClient, *resyncPeriod, informerFactory,
-		workqueue.NewItemExponentialFailureRateLimiter(*retryIntervalStart, *retryIntervalMax),
+		workqueue.NewTypedItemExponentialFailureRateLimiter[string](*retryIntervalStart, *retryIntervalMax),
 		*handleVolumeInUseError, *retryIntervalMax)
 
 	modifierName := csiModifier.Name()
 	var mc modifycontroller.ModifyController
 	// Add modify controller only if the feature gate is enabled
 	if utilfeature.DefaultFeatureGate.Enabled(features.VolumeAttributesClass) {
-		mc = modifycontroller.NewModifyController(modifierName, csiModifier, kubeClient, *resyncPeriod, informerFactory,
-			workqueue.NewItemExponentialFailureRateLimiter(*retryIntervalStart, *retryIntervalMax))
+		mc = modifycontroller.NewModifyController(modifierName, csiModifier, kubeClient, *resyncPeriod, *retryIntervalMax, *extraModifyMetadata, informerFactory,
+			workqueue.NewTypedItemExponentialFailureRateLimiter[string](*retryIntervalStart, *retryIntervalMax))
 	}
 
 	run := func(ctx context.Context) {
