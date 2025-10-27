@@ -1,41 +1,40 @@
 package modifycontroller
 
 import (
+	"errors"
+	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/kubernetes-csi/external-resizer/pkg/csi"
 	v1 "k8s.io/api/core/v1"
-	storagev1beta1 "k8s.io/api/storage/v1beta1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/utils/ptr"
 )
 
 var (
-	testVacObject = &storagev1beta1.VolumeAttributesClass{
+	testVacObject = &storagev1.VolumeAttributesClass{
 		ObjectMeta: metav1.ObjectMeta{Name: testVac},
 		DriverName: testDriverName,
 		Parameters: map[string]string{"iops": "3000"},
 	}
 
-	targetVacObject = &storagev1beta1.VolumeAttributesClass{
+	targetVacObject = &storagev1.VolumeAttributesClass{
 		ObjectMeta: metav1.ObjectMeta{Name: targetVac},
 		DriverName: testDriverName,
-		Parameters: map[string]string{
-			"iops":                             "4567",
-			"csi.storage.k8s.io/pvc/name":      pvcName,
-			"csi.storage.k8s.io/pvc/namespace": pvcNamespace,
-			"csi.storage.k8s.io/pv/name":       pvName,
-		},
+		Parameters: map[string]string{"iops": "4567"},
 	}
 )
 
 func TestModify(t *testing.T) {
-	basePVC := createTestPVC(pvcName, testVac /*vacName*/, testVac /*curVacName*/, testVac /*targetVacName*/)
+	basePVC := createTestPVC(pvcName, testVac /*vacName*/, testVac /*curVacName*/, "" /*targetVacName*/)
 	basePV := createTestPV(1, pvcName, pvcNamespace, "foobaz" /*pvcUID*/, &fsVolumeMode, testVac)
 
 	var tests = []struct {
@@ -48,7 +47,7 @@ func TestModify(t *testing.T) {
 		expectedCurrentVolumeAttributesClassName *string
 		expectedPVVolumeAttributesClassName      *string
 		withExtraMetadata                        bool
-		expectedVacParams                        map[string]string
+		expectedMutableParams                    map[string]string
 	}{
 		{
 			name:                                     "nothing to modify",
@@ -61,11 +60,11 @@ func TestModify(t *testing.T) {
 		},
 		{
 			name:             "vac does not exist, no modification and set ModifyVolumeStatus to pending",
-			pvc:              createTestPVC(pvcName, targetVac /*vacName*/, testVac /*curVacName*/, testVac /*targetVacName*/),
+			pvc:              createTestPVC(pvcName, targetVac /*vacName*/, testVac /*curVacName*/, "whatever" /*targetVacName*/),
 			pv:               basePV,
 			expectModifyCall: false,
 			expectedModifyVolumeStatus: &v1.ModifyVolumeStatus{
-				TargetVolumeAttributesClassName: testVac,
+				TargetVolumeAttributesClassName: "whatever",
 				Status:                          v1.PersistentVolumeClaimModifyVolumePending,
 			},
 			expectedCurrentVolumeAttributesClassName: &testVac,
@@ -80,6 +79,7 @@ func TestModify(t *testing.T) {
 			expectedModifyVolumeStatus:               nil,
 			expectedCurrentVolumeAttributesClassName: &targetVac,
 			expectedPVVolumeAttributesClassName:      &targetVac,
+			expectedMutableParams:                    map[string]string{"iops": "4567"},
 		},
 		{
 			name:                                     "modify volume success with extra metadata",
@@ -91,7 +91,7 @@ func TestModify(t *testing.T) {
 			expectedCurrentVolumeAttributesClassName: &targetVac,
 			expectedPVVolumeAttributesClassName:      &targetVac,
 			withExtraMetadata:                        true,
-			expectedVacParams: map[string]string{
+			expectedMutableParams: map[string]string{
 				"iops":                             "4567",
 				"csi.storage.k8s.io/pvc/name":      basePVC.GetName(),
 				"csi.storage.k8s.io/pvc/namespace": basePVC.GetNamespace(),
@@ -104,13 +104,13 @@ func TestModify(t *testing.T) {
 		test := tests[i]
 		t.Run(test.name, func(t *testing.T) {
 			// Setup
-			client := csi.NewMockClient(testDriverName, true, true, true, true, true, test.withExtraMetadata)
+			client := csi.NewMockClient(testDriverName, true, true, true, true, true)
 			initialObjects := []runtime.Object{test.pvc, test.pv, testVacObject}
 			if test.vacExists {
 				initialObjects = append(initialObjects, targetVacObject)
 			}
-			ctrlInstance, ctx := setupFakeK8sEnvironment(t, client, initialObjects)
-			defer ctx.Done()
+			ctrlInstance := setupFakeK8sEnvironment(t, client, initialObjects)
+			ctrlInstance.extraModifyMetadata = test.withExtraMetadata
 
 			// Action
 			pvc, pv, err, modifyCalled := ctrlInstance.modify(test.pvc, test.pv)
@@ -139,18 +139,94 @@ func TestModify(t *testing.T) {
 				t.Errorf("expected VolumeAttributesClassName of pv to be %v, got %v", *test.expectedPVVolumeAttributesClassName, *actualPVVolumeAttributesClassName)
 			}
 
-			if test.withExtraMetadata {
-				vacObj, err := ctrlInstance.vacLister.Get(*test.expectedPVVolumeAttributesClassName)
-				if err != nil {
-					t.Errorf("failed to get VAC: %v", err)
-				} else {
-					vacParams := vacObj.Parameters
-					if diff := cmp.Diff(test.expectedVacParams, vacParams); diff != "" {
-						t.Errorf("expected VAC parameters to be %v, got %v", test.expectedVacParams, vacParams)
-					}
+			if test.expectedMutableParams != nil {
+				p := client.GetModifiedParameters()
+				if diff := cmp.Diff(test.expectedMutableParams, p); diff != "" {
+					t.Errorf("expected mutable parameters to be %v, got %v", test.expectedMutableParams, p)
 				}
 			}
 		})
+	}
+}
+
+func TestModifyUncertain(t *testing.T) {
+	basePVC := createTestPVC(pvcName, targetVac /*vacName*/, testVac /*curVacName*/, targetVac /*targetVacName*/)
+	basePVC.Status.ModifyVolumeStatus.Status = v1.PersistentVolumeClaimModifyVolumeInProgress
+	basePV := createTestPV(1, pvcName, pvcNamespace, "foobaz" /*pvcUID*/, &fsVolumeMode, testVac)
+
+	client := csi.NewMockClient(testDriverName, true, true, true, true, true)
+	initialObjects := []runtime.Object{testVacObject, targetVacObject, basePVC, basePV}
+	ctrlInstance := setupFakeK8sEnvironment(t, client, initialObjects)
+
+	pvcKey := fmt.Sprintf("%s/%s", pvcNamespace, pvcName)
+	assertUncertain := func(uncertain bool) {
+		t.Helper()
+		_, ok := ctrlInstance.uncertainPVCs.Load(pvcKey)
+		if ok != uncertain {
+			t.Fatalf("expected uncertain state to be %v, got %v", uncertain, ok)
+		}
+	}
+
+	// initialized to uncertain
+	assertUncertain(true)
+
+	client.SetModifyError(finalErr)
+	pvc, pv, err, _ := ctrlInstance.modify(basePVC, basePV)
+	if !errors.Is(err, finalErr) {
+		t.Fatalf("expected error to be %v, got %v", finalErr, err)
+	}
+	// should clear uncertain state
+	assertUncertain(false)
+
+	client.SetModifyError(nonFinalErr)
+	pvc, pv, err, _ = ctrlInstance.modify(pvc, pv)
+	if !errors.Is(err, nonFinalErr) {
+		t.Fatalf("expected error to be %v, got %v", nonFinalErr, err)
+	}
+	// should enter uncertain state again
+	assertUncertain(true)
+
+	pvc.Spec.VolumeAttributesClassName = ptr.To("yet-another-vac")
+	pvc, _, err, _ = ctrlInstance.modify(pvc, pv)
+	if !errors.Is(err, nonFinalErr) {
+		t.Fatalf("expected error to be %v, got %v", nonFinalErr, err)
+	}
+	// target should not change, yet-another-vac should be ignored
+	if pvc.Status.ModifyVolumeStatus.TargetVolumeAttributesClassName != targetVac {
+		t.Fatalf("expected target to be %v, got %v", targetVac, pvc.Status.ModifyVolumeStatus.TargetVolumeAttributesClassName)
+	}
+}
+
+func TestCancel(t *testing.T) {
+	basePVC := createTestPVC(pvcName, "" /*vacName*/, testVac /*curVacName*/, targetVac /*targetVacName*/)
+	basePVC.Status.ModifyVolumeStatus.Status = v1.PersistentVolumeClaimModifyVolumeInProgress
+	basePVC.Status.Conditions = []v1.PersistentVolumeClaimCondition{
+		{
+			Type:   v1.PersistentVolumeClaimVolumeModifyingVolume,
+			Status: v1.ConditionTrue,
+		},
+	}
+	basePV := createTestPV(1, pvcName, pvcNamespace, "foobaz" /*pvcUID*/, &fsVolumeMode, testVac)
+
+	client := csi.NewMockClient(testDriverName, true, true, true, true, true)
+	initialObjects := []runtime.Object{testVacObject, targetVacObject, basePVC, basePV}
+	ctrlInstance := setupFakeK8sEnvironment(t, client, initialObjects)
+
+	client.SetModifyError(infeasibleErr)
+	// InProgress, so still tried
+	pvc, pv, err, _ := ctrlInstance.modify(basePVC, basePV)
+	if !errors.Is(err, infeasibleErr) {
+		t.Fatalf("expected error to be %v, got %v", finalErr, err)
+	}
+	// Got infeasibleErr error, should cancel
+	pvc, _, err, _ = ctrlInstance.modify(pvc, pv)
+	if err != nil {
+		t.Fatalf("expected modify cancelled, got %v", err)
+	}
+	if slices.ContainsFunc(pvc.Status.Conditions, func(c v1.PersistentVolumeClaimCondition) bool {
+		return c.Type == v1.PersistentVolumeClaimVolumeModifyingVolume
+	}) {
+		t.Fatalf("expected modify volume condition to be cleared, got %v", pvc.Status.Conditions)
 	}
 }
 
@@ -178,9 +254,12 @@ func createTestPVC(pvcName string, vacName string, curVacName string, targetVacN
 			CurrentVolumeAttributesClassName: &curVacName,
 			ModifyVolumeStatus: &v1.ModifyVolumeStatus{
 				TargetVolumeAttributesClassName: targetVacName,
-				Status:                          "",
+				Status:                          v1.PersistentVolumeClaimModifyVolumeInfeasible,
 			},
 		},
+	}
+	if targetVacName == "" {
+		pvc.Status.ModifyVolumeStatus = nil
 	}
 	return pvc
 }

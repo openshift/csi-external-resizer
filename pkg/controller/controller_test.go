@@ -211,7 +211,7 @@ func TestController(t *testing.T) {
 			disableVolumeInUseErrorHandler: true,
 		},
 	} {
-		client := csi.NewMockClient("mock", test.NodeResize, true, false, true, true, false)
+		client := csi.NewMockClient("mock", test.NodeResize, true, false, true, true)
 		driverName, _ := client.GetDriverName(context.TODO())
 
 		var expectedCap resource.Quantity
@@ -261,9 +261,7 @@ func TestController(t *testing.T) {
 		stopCh := make(chan struct{})
 		informerFactory.Start(stopCh)
 
-		ctx := context.TODO()
-		defer ctx.Done()
-		go controller.Run(1, ctx)
+		go controller.Run(1, t.Context(), nil)
 
 		for _, obj := range initialObjects {
 			switch obj.(type) {
@@ -380,7 +378,7 @@ func TestResizePVC(t *testing.T) {
 		},
 	} {
 		t.Run(test.Name, func(t *testing.T) {
-			client := csi.NewMockClient("mock", test.NodeResize, true, false, true, true, false)
+			client := csi.NewMockClient("mock", test.NodeResize, true, false, true, true)
 			if test.expansionError != nil {
 				client.SetExpansionError(test.expansionError)
 			}

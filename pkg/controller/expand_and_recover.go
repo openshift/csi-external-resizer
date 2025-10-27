@@ -19,10 +19,13 @@ package controller
 import (
 	"errors"
 	"fmt"
+	"time"
 
+	"github.com/kubernetes-csi/csi-lib-utils/slowset"
 	"github.com/kubernetes-csi/external-resizer/pkg/util"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 )
 
@@ -197,9 +200,32 @@ func (ctrl *resizeController) expandAndRecover(pvc *v1.PersistentVolumeClaim, pv
 	return pvc, pv, nil, true
 }
 
+func (ctrl *resizeController) removeNodeExpansionNotRequiredAnnotation(pvc *v1.PersistentVolumeClaim) *v1.PersistentVolumeClaim {
+	if !metav1.HasAnnotation(pvc.ObjectMeta, util.NodeExpansionNotRequired) {
+		return pvc
+	}
+
+	delete(pvc.Annotations, util.NodeExpansionNotRequired)
+	return pvc
+}
+
+func (ctrl *resizeController) addNodeExpansionNotRequiredAnnotation(pvc *v1.PersistentVolumeClaim) *v1.PersistentVolumeClaim {
+	if metav1.HasAnnotation(pvc.ObjectMeta, util.NodeExpansionNotRequired) {
+		return pvc
+	}
+
+	if pvc.Annotations == nil {
+		pvc.Annotations = make(map[string]string)
+	}
+	pvc.Annotations[util.NodeExpansionNotRequired] = "true"
+	return pvc
+}
+
 func (ctrl *resizeController) markForSlowRetry(pvcKey string, resizeStatus v1.ClaimResourceStatus) {
 	if resizeStatus == v1.PersistentVolumeClaimControllerResizeInfeasible {
-		ctrl.slowSet.Add(pvcKey)
+		ctrl.slowSet.Add(pvcKey, slowset.ObjectData{
+			Timestamp: time.Now(),
+		})
 	}
 }
 

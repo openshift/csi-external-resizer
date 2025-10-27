@@ -1,39 +1,35 @@
 package modifycontroller
 
 import (
-	"context"
 	"errors"
 	"fmt"
-	"github.com/kubernetes-csi/external-resizer/pkg/util"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/tools/cache"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/kubernetes-csi/external-resizer/pkg/features"
-
-	"k8s.io/client-go/util/workqueue"
-
 	"github.com/kubernetes-csi/external-resizer/pkg/csi"
+	"github.com/kubernetes-csi/external-resizer/pkg/features"
 	"github.com/kubernetes-csi/external-resizer/pkg/modifier"
-
+	"github.com/kubernetes-csi/external-resizer/pkg/util"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	v1 "k8s.io/api/core/v1"
-	storagev1beta1 "k8s.io/api/storage/v1beta1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 )
 
 func TestController(t *testing.T) {
-	basePVC := createTestPVC(pvcName, testVac /*vacName*/, testVac /*curVacName*/, testVac /*targetVacName*/)
+	basePVC := createTestPVC(pvcName, testVac /*vacName*/, testVac /*curVacName*/, "" /*targetVacName*/)
+	basePVC.Status.ModifyVolumeStatus = nil
 	basePV := createTestPV(1, pvcName, pvcNamespace, "foobaz" /*pvcUID*/, &fsVolumeMode, testVac)
 	firstTimePV := basePV.DeepCopy()
 	firstTimePV.Spec.VolumeAttributesClassName = nil
 	firstTimePVC := basePVC.DeepCopy()
 	firstTimePVC.Status.CurrentVolumeAttributesClassName = nil
-	firstTimePVC.Status.ModifyVolumeStatus = nil
 
 	tests := []struct {
 		name          string
@@ -68,11 +64,10 @@ func TestController(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			// Setup
-			client := csi.NewMockClient(testDriverName, true, true, true, true, true, false)
+			client := csi.NewMockClient(testDriverName, true, true, true, true, true)
 
 			initialObjects := []runtime.Object{test.pvc, test.pv, testVacObject, targetVacObject}
-			ctrlInstance, ctx := setupFakeK8sEnvironment(t, client, initialObjects)
-			defer ctx.Done()
+			ctrlInstance := setupFakeK8sEnvironment(t, client, initialObjects)
 
 			_, _, err, _ := ctrlInstance.modify(test.pvc, test.pv)
 			if err != nil {
@@ -120,14 +115,13 @@ func TestModifyPVC(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			client := csi.NewMockClient(testDriverName, true, true, true, true, true, false)
+			client := csi.NewMockClient(testDriverName, true, true, true, true, true)
 			if test.modifyFailure {
 				client.SetModifyError(fmt.Errorf("fake modification error"))
 			}
 
 			initialObjects := []runtime.Object{test.pvc, test.pv, testVacObject, targetVacObject}
-			ctrlInstance, ctx := setupFakeK8sEnvironment(t, client, initialObjects)
-			defer ctx.Done()
+			ctrlInstance := setupFakeK8sEnvironment(t, client, initialObjects)
 
 			_, _, err, _ := ctrlInstance.modify(test.pvc, test.pv)
 
@@ -156,6 +150,9 @@ func TestSyncPVC(t *testing.T) {
 
 	pvcWithUncreatedPV := createTestPVC(pvcName, targetVac /*vacName*/, testVac /*curVacName*/, testVac /*targetVacName*/)
 	pvcWithUncreatedPV.Spec.VolumeName = ""
+
+	inprogressPVC := createTestPVC(pvcName, "" /*vacName*/, "" /*curVacName*/, testVac /*targetVacName*/)
+	inprogressPVC.Status.ModifyVolumeStatus.Status = v1.PersistentVolumeClaimModifyVolumeInProgress
 
 	nonCSIPVC := &v1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: pvcName, Namespace: pvcNamespace},
@@ -189,15 +186,26 @@ func TestSyncPVC(t *testing.T) {
 			callCSIModify: true,
 		},
 		{
+			name:          "Should NOT modify when rollback to empty VACName",
+			pvc:           createTestPVC(pvcName, "" /*vacName*/, "" /*curVacName*/, testVac /*targetVacName*/),
+			pv:            basePV,
+			callCSIModify: false,
+		},
+		{
 			name:          "Should NOT modify if PVC managed by another CSI Driver",
 			pvc:           basePVC,
 			pv:            otherDriverPV,
 			callCSIModify: false,
 		},
 		{
-			name:          "Should NOT modify if PVC has empty Spec.VACName",
-			pvc:           createTestPVC(pvcName, "" /*vacName*/, testVac /*curVacName*/, testVac /*targetVacName*/),
+			name:          "Should execute ModifyVolume for InProgress target if PVC has empty Spec.VACName",
+			pvc:           inprogressPVC,
 			pv:            basePV,
+			callCSIModify: true,
+		},
+		{
+			name:          "Should NOT modify if PVC deleted",
+			pvc:           nil,
 			callCSIModify: false,
 		},
 		{
@@ -222,11 +230,16 @@ func TestSyncPVC(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			client := csi.NewMockClient(testDriverName, true, true, true, true, true, false)
+			client := csi.NewMockClient(testDriverName, true, true, true, true, true)
 
-			initialObjects := []runtime.Object{test.pvc, test.pv, testVacObject, targetVacObject}
-			ctrlInstance, ctx := setupFakeK8sEnvironment(t, client, initialObjects)
-			defer ctx.Done()
+			initialObjects := []runtime.Object{testVacObject, targetVacObject}
+			if test.pvc != nil {
+				initialObjects = append(initialObjects, test.pvc)
+			}
+			if test.pv != nil {
+				initialObjects = append(initialObjects, test.pv)
+			}
+			ctrlInstance := setupFakeK8sEnvironment(t, client, initialObjects)
 
 			err := ctrlInstance.syncPVC(pvcNamespace + "/" + pvcName)
 			if err != nil {
@@ -283,14 +296,13 @@ func TestInfeasibleRetry(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			// Setup
-			client := csi.NewMockClient(testDriverName, true, true, true, true, true, false)
+			client := csi.NewMockClient(testDriverName, true, true, true, true, true)
 			if test.csiModifyError != nil {
 				client.SetModifyError(test.csiModifyError)
 			}
 
 			initialObjects := []runtime.Object{test.pvc, basePV, testVacObject, targetVacObject}
-			ctrlInstance, ctx := setupFakeK8sEnvironment(t, client, initialObjects)
-			defer ctx.Done()
+			ctrlInstance := setupFakeK8sEnvironment(t, client, initialObjects)
 
 			// Attempt modification first time
 			err := ctrlInstance.syncPVC(pvcNamespace + "/" + pvcName)
@@ -328,19 +340,78 @@ func TestInfeasibleRetry(t *testing.T) {
 	}
 }
 
+// Intended to catch any race conditions in the controller
+func TestConcurrentSync(t *testing.T) {
+	cases := []struct {
+		name      string
+		waitCount int
+		err       error
+	}{
+		// TODO: This case is flaky due to fake client lacks resourceVersion support.
+		// {
+		// 	name:      "success",
+		// 	waitCount: 10,
+		// },
+		{
+			name:      "uncertain",
+			waitCount: 30,
+			err:       nonFinalErr,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := csi.NewMockClient(testDriverName, true, true, true, true, true)
+			client.SetModifyError(tc.err)
+
+			initialObjects := []runtime.Object{testVacObject, targetVacObject}
+			for i := range 10 {
+				initialObjects = append(initialObjects,
+					&v1.PersistentVolumeClaim{
+						ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("foo-%d", i), Namespace: pvcNamespace},
+						Spec: v1.PersistentVolumeClaimSpec{
+							VolumeAttributesClassName: &testVac,
+							VolumeName:                fmt.Sprintf("testPV-%d", i),
+						},
+						Status: v1.PersistentVolumeClaimStatus{
+							Phase: v1.ClaimBound,
+						},
+					},
+					&v1.PersistentVolume{
+						ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("testPV-%d", i)},
+						Spec: v1.PersistentVolumeSpec{
+							PersistentVolumeSource: v1.PersistentVolumeSource{
+								CSI: &v1.CSIPersistentVolumeSource{
+									Driver:       testDriverName,
+									VolumeHandle: fmt.Sprintf("foo-%d", i),
+								},
+							},
+						},
+					},
+				)
+			}
+			ctrlInstance := setupFakeK8sEnvironment(t, client, initialObjects)
+			wg := sync.WaitGroup{}
+			t.Cleanup(wg.Wait)
+			go ctrlInstance.Run(3, t.Context(), &wg)
+
+			for client.GetModifyCount() < tc.waitCount {
+				time.Sleep(20 * time.Millisecond)
+			}
+		})
+	}
+}
+
 // setupFakeK8sEnvironment creates fake K8s environment and starts Informers and ModifyController
-func setupFakeK8sEnvironment(t *testing.T, client *csi.MockClient, initialObjects []runtime.Object) (*modifyController, context.Context) {
+func setupFakeK8sEnvironment(t *testing.T, client *csi.MockClient, initialObjects []runtime.Object) *modifyController {
 	t.Helper()
 
 	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.VolumeAttributesClass, true)
 
 	/* Create fake kubeClient, Informers, and ModifyController */
 	kubeClient, informerFactory := fakeK8s(initialObjects)
-	pvInformer := informerFactory.Core().V1().PersistentVolumes()
-	pvcInformer := informerFactory.Core().V1().PersistentVolumeClaims()
-	vacInformer := informerFactory.Storage().V1beta1().VolumeAttributesClasses()
 
-	driverName, _ := client.GetDriverName(context.TODO())
+	ctx := t.Context()
+	driverName, _ := client.GetDriverName(ctx)
 
 	csiModifier, err := modifier.NewModifierFromClient(client, 15*time.Second, kubeClient, informerFactory, false, driverName)
 	if err != nil {
@@ -353,27 +424,10 @@ func setupFakeK8sEnvironment(t *testing.T, client *csi.MockClient, initialObject
 		workqueue.DefaultTypedControllerRateLimiter[string]())
 
 	/* Start informers and ModifyController*/
-	stopCh := make(chan struct{})
-	informerFactory.Start(stopCh)
+	informerFactory.Start(ctx.Done())
 
-	ctx := context.TODO()
-	go controller.Run(1, ctx)
+	ctrlInstance := controller.(*modifyController)
+	ctrlInstance.init(ctx)
 
-	/* Add initial objects to informer caches */
-	for _, obj := range initialObjects {
-		switch obj.(type) {
-		case *v1.PersistentVolume:
-			pvInformer.Informer().GetStore().Add(obj)
-		case *v1.PersistentVolumeClaim:
-			pvcInformer.Informer().GetStore().Add(obj)
-		case *storagev1beta1.VolumeAttributesClass:
-			vacInformer.Informer().GetStore().Add(obj)
-		default:
-			t.Fatalf("Test %s: Unknown initalObject type: %+v", t.Name(), obj)
-		}
-	}
-
-	ctrlInstance, _ := controller.(*modifyController)
-
-	return ctrlInstance, ctx
+	return ctrlInstance
 }
