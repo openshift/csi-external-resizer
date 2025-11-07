@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kubernetes-csi/csi-lib-utils/metrics"
@@ -44,7 +45,7 @@ import (
 	csitrans "k8s.io/csi-translation-lib"
 
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/wait"
+	server "k8s.io/apiserver/pkg/server"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	cflag "k8s.io/component-base/cli/flag"
@@ -149,6 +150,21 @@ func main() {
 		klog.ErrorS(err, "Failed to create kube client")
 		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
+	// if feature gate is not explicitly set, probe if we have VAC API available
+	if !utilfeature.DefaultMutableFeatureGate.ExplicitlySet(features.VolumeAttributesClass) {
+		enabled, err := features.IsVolumeAttributesClassV1Enabled(kubeClient.Discovery())
+		switch {
+		case err != nil:
+			klog.ErrorS(err, "Failed to check VolumeAttributesClass V1 API availability")
+		case enabled:
+			klog.InfoS("VolumeAttributesClass v1 API is available")
+		default:
+			klog.InfoS("Disabling VolumeAttributesClass feature gate because the VolumeAttributesClass v1 API is not available")
+			if err := utilfeature.DefaultMutableFeatureGate.OverrideDefault(features.VolumeAttributesClass, false); err != nil {
+				klog.Fatalf("Failed to disable VolumeAttributesClass feature gate: %v", err)
+			}
+		}
+	}
 
 	informerFactory := informers.NewSharedInformerFactory(kubeClient, *resyncPeriod)
 
@@ -235,13 +251,47 @@ func main() {
 			workqueue.NewTypedItemExponentialFailureRateLimiter[string](*retryIntervalStart, *retryIntervalMax))
 	}
 
+	// handle SIGTERM and SIGINT by cancelling the context.
+	var (
+		terminate       func()          // called when all controllers are finished
+		controllerCtx   context.Context // shuts down all controllers on a signal
+		shutdownHandler <-chan struct{} // called when the signal is received
+	)
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.ReleaseLeaderElectionOnExit) {
+		// ctx waits for all controllers to finish, then shuts down the whole process, incl. leader election
+		ctx, terminate = context.WithCancel(ctx)
+		var cancelControllerCtx context.CancelFunc
+		controllerCtx, cancelControllerCtx = context.WithCancel(ctx)
+		shutdownHandler = server.SetupSignalHandler()
+
+		defer terminate()
+
+		go func() {
+			defer cancelControllerCtx()
+			<-shutdownHandler
+			klog.Info("Received SIGTERM or SIGINT signal, shutting down controller.")
+		}()
+	}
+
 	run := func(ctx context.Context) {
-		informerFactory.Start(wait.NeverStop)
-		go rc.Run(*workers, ctx)
-		if utilfeature.DefaultFeatureGate.Enabled(features.VolumeAttributesClass) {
-			go mc.Run(*workers, ctx)
+		informerFactory.Start(ctx.Done())
+		if utilfeature.DefaultFeatureGate.Enabled(features.ReleaseLeaderElectionOnExit) {
+			var wg sync.WaitGroup
+			go rc.Run(*workers, controllerCtx, &wg)
+			if utilfeature.DefaultFeatureGate.Enabled(features.VolumeAttributesClass) {
+				go mc.Run(*workers, controllerCtx, &wg)
+			}
+			<-controllerCtx.Done()
+			wg.Wait()
+			terminate()
+		} else {
+			go rc.Run(*workers, ctx, nil)
+			if utilfeature.DefaultFeatureGate.Enabled(features.VolumeAttributesClass) {
+				go mc.Run(*workers, ctx, nil)
+			}
+			<-ctx.Done()
 		}
-		<-ctx.Done()
 	}
 
 	if !*enableLeaderElection {
@@ -265,6 +315,10 @@ func main() {
 		le.WithLeaseDuration(*leaderElectionLeaseDuration)
 		le.WithRenewDeadline(*leaderElectionRenewDeadline)
 		le.WithRetryPeriod(*leaderElectionRetryPeriod)
+		if utilfeature.DefaultFeatureGate.Enabled(features.ReleaseLeaderElectionOnExit) {
+			le.WithReleaseOnCancel(true)
+			le.WithContext(ctx)
+		}
 
 		if err := le.Run(); err != nil {
 			klog.ErrorS(err, "Error initializing leader election")

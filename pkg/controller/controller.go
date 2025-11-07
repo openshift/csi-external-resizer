@@ -20,8 +20,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
+	"github.com/kubernetes-csi/csi-lib-utils/slowset"
 	"github.com/kubernetes-csi/external-resizer/pkg/features"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
@@ -52,7 +54,7 @@ import (
 // If requested, it will resize according PVs and update PVCs' status to reflect the new size.
 type ResizeController interface {
 	// Run starts the controller.
-	Run(workers int, ctx context.Context)
+	Run(workers int, ctx context.Context, wg *sync.WaitGroup)
 }
 
 type resizeController struct {
@@ -72,7 +74,7 @@ type resizeController struct {
 
 	// slowSet is used to track PVCs for which expansion failed with infeasible error
 	// and should be retried at slower rate.
-	slowSet *util.SlowSet
+	slowSet *slowset.SlowSet
 
 	// a cache to store PersistentVolume objects
 	volumes cache.Store
@@ -114,7 +116,7 @@ func NewResizeController(
 		volumes:                pvInformer.Informer().GetStore(),
 		claims:                 pvcInformer.Informer().GetStore(),
 		eventRecorder:          eventRecorder,
-		slowSet:                util.NewSlowSet(maxRetryInterval),
+		slowSet:                slowset.NewSlowSet(maxRetryInterval),
 		finalErrorPVCs:         sets.New[string](),
 		usedPVCs:               newUsedPVCStore(),
 		handleVolumeInUseError: handleVolumeInUseError,
@@ -269,7 +271,7 @@ func (ctrl *resizeController) deletePVC(obj interface{}) {
 }
 
 // Run starts the controller.
-func (ctrl *resizeController) Run(workers int, ctx context.Context) {
+func (ctrl *resizeController) Run(workers int, ctx context.Context, wg *sync.WaitGroup) {
 	defer ctrl.claimQueue.ShutDown()
 
 	klog.InfoS("Starting external resizer", "controller", ctrl.name)
@@ -290,8 +292,18 @@ func (ctrl *resizeController) Run(workers int, ctx context.Context) {
 		go ctrl.slowSet.Run(stopCh)
 	}
 
-	for i := 0; i < workers; i++ {
-		go wait.Until(ctrl.syncPVCs, 0, stopCh)
+	if utilfeature.DefaultFeatureGate.Enabled(features.ReleaseLeaderElectionOnExit) {
+		for range workers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				wait.Until(ctrl.syncPVCs, 0, stopCh)
+			}()
+		}
+	} else {
+		for range workers {
+			go wait.Until(ctrl.syncPVCs, 0, stopCh)
+		}
 	}
 
 	<-stopCh
