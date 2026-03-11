@@ -26,8 +26,8 @@ import (
 	csilib "github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/csi-lib-utils/accessmodes"
 	"github.com/kubernetes-csi/csi-lib-utils/connection"
-	"github.com/kubernetes-csi/external-resizer/pkg/csi"
-	"github.com/kubernetes-csi/external-resizer/pkg/util"
+	"github.com/kubernetes-csi/external-resizer/v2/pkg/csi"
+	"github.com/kubernetes-csi/external-resizer/v2/pkg/util"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -38,7 +38,7 @@ import (
 
 var (
 	controllerServiceNotSupportErr = errors.New("CSI driver does not support controller service")
-	resizeNotSupportErr            = errors.New("CSI driver neither supports controller resize nor node resize")
+	ResizeNotSupportErr            = errors.New("CSI driver neither supports controller resize nor node resize")
 )
 
 func NewResizerFromClient(
@@ -70,7 +70,7 @@ func NewResizerFromClient(
 			klog.InfoS("The CSI driver supports node resize only, using trivial resizer to handle resize requests")
 			return newTrivialResizer(driverName), nil
 		}
-		return nil, resizeNotSupportErr
+		return nil, ResizeNotSupportErr
 	}
 
 	_, err = supportsControllerSingleNodeMultiWriter(csiClient, timeout)
