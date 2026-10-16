@@ -1,28 +1,7 @@
-## Release notes for 2.2.1
-
-[Documentation](https://kubernetes-csi.github.io)
-
-# Changelog since 2.2.0
-
-## Changes by Kind
-
-### Other (Cleanup or Flake)
-
-- Update golang.org/x/crypto to latest version - v0.53.0 (#589, @chethanv28)
-
-## Dependencies
-
-### Changed
-- golang.org/x/crypto: v0.47.0 → v0.53.0
-- golang.org/x/net: v0.49.0 → v0.55.0
-- golang.org/x/sync: v0.19.0 → v0.21.0
-- golang.org/x/sys: v0.40.0 → v0.46.0
-- golang.org/x/term: v0.39.0 → v0.44.0
-- golang.org/x/text: v0.33.0 → v0.38.0
-
 ## Release notes for 2.2.0
 
 [Documentation](https://kubernetes-csi.github.io)
+
 
 # Changelog since 2.1.0
 
@@ -30,11 +9,12 @@
 
 ### Other (Cleanup or Flake)
 
-- Bump k8s dependencies to v1.36.1 (#578, @dfajmon)
+- Bump k8s dependencies to v1.36.1 ([#578](https://github.com/kubernetes-csi/external-resizer/pull/578), [@dfajmon](https://github/dfajmon))
 
 ### Feature
 
-- Move RecoverVolumeExpansionFailure feature-gate to GA (#577, @gnufied). This was feature was already GAed in Kubernetes v1.34, so this change in feature-gate of external-resizer is merely ceremonial.
+- Allow resuming of resize operation if PVC is deleted while resize is pending ([#581](https://github.com/kubernetes-csi/external-resizer/pull/581), [@gnufied](https://github.com/gnufied))
+- Move RecoverVolumeExpansionFailure to GA ([#577](https://github.com/kubernetes-csi/external-resizer/pull/577), [@gnufied](https://github/com/gnufied))
 
 ## Dependencies
 

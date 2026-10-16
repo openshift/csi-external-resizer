@@ -29,15 +29,8 @@ import (
 const (
 	// owner: @sunpa93
 	// alpha: v1.22
+	// beta: v2.2
 	AnnotateFsResize featuregate.Feature = "AnnotateFsResize"
-
-	// owner: @gnufied
-	// alpha: v1.23
-	// beta: v1.32
-	// GA: v1.37
-	//
-	// Allows users to recover from volume expansion failures
-	RecoverVolumeExpansionFailure featuregate.Feature = "RecoverVolumeExpansionFailure"
 
 	// owner: @sunnylovestiramisu
 	// kep: https://kep.k8s.io/3751
@@ -60,10 +53,9 @@ func init() {
 }
 
 var defaultResizerFeatureGates = map[featuregate.Feature]featuregate.FeatureSpec{
-	AnnotateFsResize:              {Default: false, PreRelease: featuregate.Alpha},
-	RecoverVolumeExpansionFailure: {Default: true, PreRelease: featuregate.GA},
-	VolumeAttributesClass:         {Default: true, PreRelease: featuregate.GA},
-	ReleaseLeaderElectionOnExit:   {Default: false, PreRelease: featuregate.Alpha},
+	AnnotateFsResize:            {Default: true, PreRelease: featuregate.Beta},
+	VolumeAttributesClass:       {Default: true, PreRelease: featuregate.GA},
+	ReleaseLeaderElectionOnExit: {Default: false, PreRelease: featuregate.Alpha},
 }
 
 // IsVolumeAttributesClassV1Enabled checks if the VolumeAttributesClass v1 API is enabled.
